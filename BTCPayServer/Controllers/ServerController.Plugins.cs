@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using BTCPayServer.Abstractions.Contracts;
+using BTCPayServer.Abstractions.Extensions;
+using BTCPayServer.Abstractions.Models;
 using BTCPayServer.Configuration;
-using BTCPayServer.Contracts;
 using BTCPayServer.Models;
 using BTCPayServer.Plugins;
 using Microsoft.AspNetCore.Http;
@@ -79,12 +81,20 @@ namespace BTCPayServer.Controllers
 
         [HttpPost("server/plugins/install")]
         public async Task<IActionResult> InstallPlugin(
-            [FromServices] PluginService pluginService, string plugin)
+            [FromServices] PluginService pluginService, string plugin , bool update = false)
         {
             try
             {
                 await pluginService.DownloadRemotePlugin(plugin);
-                pluginService.InstallPlugin(plugin);
+                if (update)
+                {
+                    pluginService.UpdatePlugin(plugin);
+                }
+                else
+                {
+                    
+                    pluginService.InstallPlugin(plugin);
+                }
                 TempData.SetStatusMessageModel(new StatusMessageModel()
                 {
                     Message = "Plugin scheduled to be installed.",

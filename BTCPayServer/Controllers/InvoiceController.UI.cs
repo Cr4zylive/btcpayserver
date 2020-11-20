@@ -6,6 +6,9 @@ using System.Net.Mime;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
+using BTCPayServer.Abstractions.Constants;
+using BTCPayServer.Abstractions.Extensions;
+using BTCPayServer.Abstractions.Models;
 using BTCPayServer.Client;
 using BTCPayServer.Client.Models;
 using BTCPayServer.Data;
@@ -39,6 +42,51 @@ namespace BTCPayServer.Controllers
 {
     public partial class InvoiceController
     {
+
+        [HttpGet]
+        [Route("invoices/{invoiceId}/deliveries/{deliveryId}/request")]
+        [Authorize(AuthenticationSchemes = AuthenticationSchemes.Cookie)]
+        public async Task<IActionResult> WebhookDelivery(string invoiceId, string deliveryId)
+        {
+            var invoice = (await _InvoiceRepository.GetInvoices(new InvoiceQuery()
+            {
+                InvoiceId = new[] { invoiceId },
+                UserId = GetUserId()
+            })).FirstOrDefault();
+            if (invoice is null)
+                return NotFound();
+            var delivery = await _InvoiceRepository.GetWebhookDelivery(invoiceId, deliveryId);
+            if (delivery is null)
+                return NotFound();
+            return this.File(delivery.GetBlob().Request, "application/json");
+        }
+        [HttpPost]
+        [Route("invoices/{invoiceId}/deliveries/{deliveryId}/redeliver")]
+        [Authorize(Policy = Policies.CanModifyStoreSettings, AuthenticationSchemes = AuthenticationSchemes.Cookie)]
+        public async Task<IActionResult> RedeliverWebhook(string storeId, string invoiceId, string deliveryId)
+        {
+            var invoice = (await _InvoiceRepository.GetInvoices(new InvoiceQuery()
+            {
+                InvoiceId = new[] { invoiceId },
+                StoreId = new[] { storeId },
+                UserId = GetUserId()
+            })).FirstOrDefault();
+            if (invoice is null)
+                return NotFound();
+            var delivery = await _InvoiceRepository.GetWebhookDelivery(invoiceId, deliveryId);
+            if (delivery is null)
+                return NotFound();
+            var newDeliveryId = await WebhookNotificationManager.Redeliver(deliveryId);
+            if (newDeliveryId is null)
+                return NotFound();
+            TempData[WellKnownTempData.SuccessMessage] = "Successfully planned a redelivery";
+            return RedirectToAction(nameof(Invoice),
+                new
+                {
+                    invoiceId
+                });
+        }
+
         [HttpGet]
         [Route("invoices/{invoiceId}")]
         [Authorize(AuthenticationSchemes = AuthenticationSchemes.Cookie)]
@@ -58,6 +106,7 @@ namespace BTCPayServer.Controllers
             var store = await _StoreRepository.FindStore(invoice.StoreId);
             var model = new InvoiceDetailsModel()
             {
+                StoreId = store.Id,
                 StoreName = store.StoreName,
                 StoreLink = Url.Action(nameof(StoresController.UpdateStore), "Stores", new { storeId = store.Id }),
                 Id = invoice.Id,
@@ -80,6 +129,9 @@ namespace BTCPayServer.Controllers
                 PosData = PosDataParser.ParsePosData(invoice.Metadata.PosData),
                 Archived = invoice.Archived,
                 CanRefund = CanRefund(invoice.GetInvoiceState()),
+                Deliveries = (await _InvoiceRepository.GetWebhookDeliveries(invoiceId))
+                                    .Select(c => new Models.StoreViewModels.DeliveryViewModel(c))
+                                    .ToList()
             };
             model.Addresses = invoice.HistoricalAddresses.Select(h =>
                 new InvoiceDetailsModel.AddressModel
@@ -464,11 +516,8 @@ namespace BTCPayServer.Controllers
             var paymentMethod = invoice.GetPaymentMethod(paymentMethodId);
             var paymentMethodDetails = paymentMethod.GetPaymentMethodDetails();
             var dto = invoice.EntityToDTO();
-            var cryptoInfo = dto.CryptoInfo.First(o => o.GetpaymentMethodId() == paymentMethodId);
             var storeBlob = store.GetStoreBlob();
-            var currency = invoice.Currency;
             var accounting = paymentMethod.Calculate();
-
 
             CoinSwitchSettings coinswitch = (storeBlob.CoinSwitchSettings != null && storeBlob.CoinSwitchSettings.Enabled &&
                                            storeBlob.CoinSwitchSettings.IsConfigured())
@@ -492,12 +541,11 @@ namespace BTCPayServer.Controllers
                 CryptoImage = Request.GetRelativePathOrAbsolute(paymentMethodHandler.GetCryptoImage(paymentMethodId)),
                 BtcAddress = paymentMethodDetails.GetPaymentDestination(),
                 BtcDue = accounting.Due.ShowMoney(divisibility),
+                InvoiceCurrency = invoice.Currency,
                 OrderAmount = (accounting.TotalDue - accounting.NetworkFee).ShowMoney(divisibility),
                 OrderAmountFiat = OrderAmountFromInvoice(network.CryptoCode, invoice),
                 CustomerEmail = invoice.RefundMail,
                 RequiresRefundEmail = storeBlob.RequiresRefundEmail,
-                ShowRecommendedFee = storeBlob.ShowRecommendedFee,
-                FeeRate = paymentMethodDetails.GetFeeRate(),
                 ExpirationSeconds = Math.Max(0, (int)(invoice.ExpirationTime - DateTimeOffset.UtcNow).TotalSeconds),
                 MaxTimeSeconds = (int)(invoice.ExpirationTime - invoice.InvoiceTime).TotalSeconds,
                 MaxTimeMinutes = (int)(invoice.ExpirationTime - invoice.InvoiceTime).TotalMinutes,
@@ -506,7 +554,6 @@ namespace BTCPayServer.Controllers
                 MerchantRefLink = invoice.RedirectURL?.AbsoluteUri ?? "/",
                 RedirectAutomatically = invoice.RedirectAutomatically,
                 StoreName = store.StoreName,
-                PeerInfo = (paymentMethodDetails as LightningLikePaymentMethodDetails)?.NodeInfo,
                 TxCount = accounting.TxRequired,
                 BtcPaid = accounting.Paid.ShowMoney(divisibility),
 #pragma warning disable CS0618 // Type or member is obsolete
@@ -544,12 +591,7 @@ namespace BTCPayServer.Controllers
                                           .OrderByDescending(a => a.CryptoCode == "BTC").ThenBy(a => a.PaymentMethodName).ThenBy(a => a.IsLightning ? 1 : 0)
                                           .ToList()
             };
-
-            paymentMethodHandler.PreparePaymentModel(model, dto, storeBlob);
-            if (model.IsLightning && storeBlob.LightningAmountInSatoshi && model.CryptoCode == "Sats")
-            {
-                model.Rate = _CurrencyNameTable.DisplayFormatCurrency(paymentMethod.Rate / 100_000_000, paymentMethod.ParentEntity.Currency);
-            }
+            paymentMethodHandler.PreparePaymentModel(model, dto, storeBlob, paymentMethod);
             model.UISettings = paymentMethodHandler.GetCheckoutUISettings();
             model.PaymentMethodId = paymentMethodId.ToString();
             var expiration = TimeSpan.FromSeconds(model.ExpirationSeconds);
